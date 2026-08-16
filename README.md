@@ -1,6 +1,8 @@
-# GLM-5.3 — Three.js Water Simulation Shootout
+# Three.js Water Simulation Shootout
 
 Three LLMs were given the exact same prompt and asked to produce a **single self-contained HTML file**. This folder holds their three independent outputs.
+
+Original prompt by [@WescheNex1q](https://x.com/WescheNex1q).
 
 ## The prompt
 
