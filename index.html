@@ -69,12 +69,12 @@
 
   /* ---------- cards ---------- */
   .grid { margin-top: 38px; display: grid; grid-template-columns: repeat(3, 1fr);
-    gap: 24px; max-width: 1120px; width: 100%; }
-  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+    gap: 26px; max-width: 1380px; width: 100%; }
+  @media (max-width: 1080px) { .grid { grid-template-columns: 1fr; max-width: 760px; } }
   .card {
     position: relative; display: flex; flex-direction: column;
     background: var(--surface); border: 1px solid var(--line); border-radius: 20px;
-    box-shadow: var(--shadow); padding: 26px 24px 22px; overflow: hidden;
+    box-shadow: var(--shadow); padding: 30px 30px 26px; overflow: hidden;
     transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
   }
   .card:hover { transform: translateY(-4px); box-shadow: var(--shadow-lg); border-color: rgba(24,78,132,.28); }
