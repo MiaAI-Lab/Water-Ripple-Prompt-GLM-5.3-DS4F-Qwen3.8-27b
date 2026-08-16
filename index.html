@@ -24,9 +24,13 @@
     background:linear-gradient(180deg, rgba(13,34,52,.9), rgba(7,19,30,.9));
     transition:transform .12s ease, border-color .12s ease, box-shadow .12s ease; }
   a.card:hover { transform:translateY(-3px); border-color:rgba(159,212,255,.6); box-shadow:0 8px 24px rgba(0,0,0,.4); }
-  .model { font-size:15px; font-weight:700; letter-spacing:.04em; margin-bottom:6px; }
+  .model { font-size:15px; font-weight:700; letter-spacing:.04em; margin-bottom:10px; }
   .model.ds  { color:#6ecbf5; } .model.glm5 { color:#ffb37a; } .model.qwen { color:#9ff0b8; }
-  .file { font-size:12px; color:var(--mut); margin-bottom:12px; word-break:break-all; }
+  .file { display:block; font-size:22px; font-weight:700; letter-spacing:.02em; text-align:center;
+    color:#fff; word-break:break-all; padding:12px 8px; margin-bottom:12px; border-radius:10px;
+    background:rgba(159,212,255,.12); border:1px solid rgba(159,212,255,.55);
+    box-shadow:0 0 18px rgba(90,170,255,.18) inset, 0 0 12px rgba(90,170,255,.25); }
+  a.card:hover .file { background:rgba(159,212,255,.22); border-color:#9fd4ff; box-shadow:0 0 22px rgba(90,170,255,.35) inset, 0 0 16px rgba(90,170,255,.45); }
   .tag { display:inline-block; font-size:10.5px; padding:2px 8px; border-radius:20px;
     border:1px solid var(--line); color:var(--mut); margin-top:8px; }
   .open { margin-top:12px; font-size:11.5px; color:#9fd4ff; letter-spacing:.08em; }
@@ -51,20 +55,20 @@ No external libraries besides Three.js</div>
 
   <div class="grid">
     <a class="card" href="ds4f.html" target="_blank" rel="noopener">
-      <div class="model ds">DeepSeek v4 Flash</div>
       <div class="file">ds4f.html</div>
+      <div class="model ds">DeepSeek v4 Flash</div>
       <span class="tag">analytic shader waves</span>
       <div class="open">▶ open demo</div>
     </a>
     <a class="card" href="glm53.html" target="_blank" rel="noopener">
-      <div class="model glm5">GLM-5.3</div>
       <div class="file">glm53.html</div>
+      <div class="model glm5">GLM-5.3</div>
       <span class="tag">GPU wave equation</span>
       <div class="open">▶ open demo</div>
     </a>
     <a class="card" href="qwen38-27b.html" target="_blank" rel="noopener">
-      <div class="model qwen">Qwen3.8-27B</div>
       <div class="file">qwen38-27b.html</div>
+      <div class="model qwen">Qwen3.8-27B</div>
       <span class="tag">CPU finite-difference</span>
       <div class="open">▶ open demo</div>
     </a>
