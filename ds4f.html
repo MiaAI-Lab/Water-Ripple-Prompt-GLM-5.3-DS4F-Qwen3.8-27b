@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three.js Water Simulation</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;height:100%;background:#04121c;}
+  #hud{
+    position:fixed;top:14px;left:16px;z-index:10;
+    font:13px/1.5 "SF Mono",Consolas,Menlo,monospace;
+    color:#cfe8ff;text-shadow:0 1px 3px rgba(0,0,0,.8);
+    background:rgba(5,20,35,.45);padding:10px 14px;border-radius:10px;
+    border:1px solid rgba(120,180,255,.25);backdrop-filter:blur(4px);
+    user-select:none;pointer-events:none;
+  }
+  #hud b{color:#9fd4ff;}
+  #err{position:fixed;left:16px;bottom:16px;z-index:20;max-width:70%;
+    font:12px/1.4 monospace;color:#ffb4b4;background:rgba(60,0,0,.6);
+    padding:8px 10px;border-radius:8px;white-space:pre-wrap;display:none;}
+</style>
+</head>
+<body>
+<div id="hud">click &amp; drag water : drop a ripple &nbsp;·&nbsp; drag sky : orbit &nbsp;·&nbsp; wheel : zoom<br>
+fps <b id="fps">–</b> &nbsp; ripples <b id="rc">0</b> &nbsp; verts <span id="vc"></span></div>
+<div id="err"></div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.170.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ---------------- diagnostics hooks (headless verification) ---------------- */
+window.__WATER = { frames:0, ripples:0, errors:[], avg:[0,0,0], fps:0, gl:false };
+window.addEventListener('error', e => window.__WATER.errors.push(String(e.message)));
+window.addEventListener('unhandledrejection', e => window.__WATER.errors.push('promise:'+String(e.reason)));
+
+/* ---------------- renderer / scene / camera ---------------- */
+const SIZE = 1600;               // water plane width & height (world units)
+const SEGS = 512;                // subdivisions per side (513x513 vertices)
+const MAX_RIPPLES = 64;
+
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+window.__WATER.gl = renderer.getContext() instanceof WebGL2RenderingContext
+  ? 2 : (renderer.getContext() instanceof WebGLRenderingContext ? 1 : 0);
+document.getElementById('vc').textContent = (SEGS+1)*(SEGS+1).toLocaleString ? (SEGS+1)*(SEGS+1).toLocaleString() : '';
+
+const scene = new THREE.Scene();
+
+/* gradient sky background built from a small canvas */
+{
+  const c = document.createElement('canvas'); c.width = 2; c.height = 256;
+  const g = c.getContext('2d');
+  const gr = g.createLinearGradient(0,0,0,256);
+  gr.addColorStop(0.00, '#07182b');
+  gr.addColorStop(0.45, '#13405e');
+  gr.addColorStop(0.62, '#3d7090');
+  gr.addColorStop(0.76, '#7ba8b6');
+  gr.addColorStop(1.00, '#a7c2b8');
+  g.fillStyle = gr; g.fillRect(0,0,2,256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  scene.background = tex;
+}
+scene.fog = new THREE.Fog(0x13405e, 700, 2600);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 1, 6000);
+camera.position.set(860, 520, 860);
+camera.lookAt(0,0,0);
+
+/* ---------------- ripple state ---------------- */
+const rippleBuf = new Array(MAX_RIPPLES).fill(0).map(() => new THREE.Vector4()); // x,y,t0,amp
+let rippleCount = 0, rippleCursor = 0;
+
+function addRipple(lx, ly, amp){
+  const v = rippleBuf[rippleCursor];
+  v.x = lx; v.y = ly; v.z = now(); v.w = amp;
+  rippleCursor = (rippleCursor + 1) % MAX_RIPPLES;
+  rippleCount = Math.min(rippleCount + 1, MAX_RIPPLES);
+  slide('rc', rippleCount);
+}
+function slide(id, txt){ const el = document.getElementById(id); if(el) el.textContent = txt; }
+
+/* ---------------- water material (custom shader: waves + lighting) ---------------- */
+const uniforms = {
+  uTime:   { value: 0 },
+  uSunDir: { value: new THREE.Vector3(0.5, 0.6, 0.4).normalize() },
+  uCamPos: { value: camera.position.clone() },
+  uRipples:{ value: rippleBuf },
+  uRippleCount: { value: 0 },
+  uDeep:   { value: new THREE.Color(0x05304a) },
+  uHorizon:{ value: new THREE.Color(0x9cc4d6) },
+  uSun:    { value: new THREE.Color(0xfff2cf) },
+};
+
+const material = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: /* glsl */`
+    uniform float uTime;
+    uniform vec4 uRipples[${MAX_RIPPLES}];
+    uniform int   uRippleCount;
+    varying vec3 vWorldPos;
+    varying vec3 vWorldNormal;
+
+    /* ambient directional swells */
+    float ambientH(vec2 p, out vec2 g){
+      float h = 0.0; vec2 gh = vec2(0.0);
+      h += 5.0*sin(dot(p,vec2(0.009, 0.006)) + uTime*0.8);
+      h += 3.6*sin(dot(p,vec2(-0.007, 0.011)) + uTime*0.6);
+      h += 2.8*sin(dot(p,vec2(0.005,-0.009)) + uTime*1.1);
+      h += 1.6*sin(dot(p,vec2(0.013, 0.003)) + uTime*1.4);
+      // analytic gradient of the ambient sum: d/dx of a sin(dot(p,d)+p*..) = A*d.x*cos(...)
+      gh = vec2(
+        5.0*0.009*cos(dot(p,vec2(0.009, 0.006))+uTime*0.8) + 3.6*(-0.007)*cos(dot(p,vec2(-0.007,0.011))+uTime*0.6)
+      + 2.8*0.005*cos(dot(p,vec2(0.005,-0.009))+uTime*1.1) + 1.6*0.013*cos(dot(p,vec2(0.013,0.003))+uTime*1.4),
+        5.0*0.006*cos(dot(p,vec2(0.009, 0.006))+uTime*0.8) + 3.6*0.011*cos(dot(p,vec2(-0.007,0.011))+uTime*0.6)
+      + 2.8*(-0.009)*cos(dot(p,vec2(0.005,-0.009))+uTime*1.1) + 1.6*0.003*cos(dot(p,vec2(0.013,0.003))+uTime*1.4));
+      g = gh; return h;
+    }
+
+    float rippleH(vec2 p, out vec2 g){
+      float hh = 0.0;
+      vec2 gg = vec2(0.0);
+      for(int i=0;i<${MAX_RIPPLES};i++){
+        if(i >= uRippleCount) break;
+        vec4 rp = uRipples[i];
+        float dt = uTime - rp.z;
+        if(dt <= 0.0) continue;
+        vec2 rel = p - rp.xy;
+        float r = length(rel);
+        float sig = 16.0 + dt*2.2;
+        float env = exp(-0.5*(r*r)/(sig*sig)) * exp(-dt/9.0);
+        float phase = 0.42*r - 4.4*dt;          // travelling ring pattern
+        hh += rp.w * env * cos(phase);
+        float dh = rp.w * env * (-(r/(sig*sig))*cos(phase) - 0.42*sin(phase));
+        gg += (r > 1e-4) ? dh * rel / r : vec2(0.0);
+      }
+      g = gg; return hh;
+    }
+
+    void main(){
+      vec2 p = position.xz;              // plane params (geometry pre-rotated flat in XZ)
+      vec2 gA; float hA = ambientH(p, gA);
+      vec2 gR; float hR = rippleH(p, gR);
+      float h = hA + hR;
+      vec2 g = gA + gR;
+      vec3 localPos = vec3(position.x, h, position.z);   // displace along +Y (world up)
+      vec3 nLocal  = normalize(vec3(-g.x, 1.0, -g.y));
+      vec4 wp = modelMatrix * vec4(localPos, 1.0);
+      vWorldPos   = wp.xyz;
+      vWorldNormal= normalize(mat3(modelMatrix) * nLocal);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3 uSunDir;
+    uniform vec3 uCamPos;
+    uniform vec3 uDeep;
+    uniform vec3 uHorizon;
+    uniform vec3 uSun;
+    varying vec3 vWorldPos;
+    varying vec3 vWorldNormal;
+    void main(){
+      vec3 N = normalize(vWorldNormal);
+      vec3 V = normalize(uCamPos - vWorldPos);
+      float fres = pow(1.0 - max(dot(N,V),0.0), 4.0);
+      float up = clamp(N.y*0.5+0.5, 0.0, 1.0);
+      vec3 col = mix(uDeep, uHorizon, fres*0.9 + up*0.25);
+      vec3 L = normalize(uSunDir);
+      float ndl = clamp(dot(N,L), 0.0, 1.0);
+      col *= 0.35 + 0.85*ndl;
+      vec3 H = normalize(L + V);
+      float spec = pow(max(dot(N,H),0.0), 220.0);
+      col += uSun * spec * 2.2;
+      col += uSun * pow(max(dot(N,H),0.0), 14.0) * 0.12;  // broad sheen
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+});
+
+const water = new THREE.Mesh(
+  new THREE.PlaneGeometry(SIZE, SIZE, SEGS, SEGS),
+  material
+);
+water.geometry.rotateX(-Math.PI/2); // lay it flat, +y up
+scene.add(water);
+
+/* ---------------- diagnostics (headless verification) ---------------- */
+window.__WATER_INFO = () => {
+  const info = renderer.info.render;
+  const bb = new THREE.Box3().setFromObject(water);
+  return {
+    calls: info.calls,
+    triangles: info.triangles,
+    verts: water.geometry.attributes.position.count,
+    progBuilt: !!material.program,
+    meshVisible: water.visible,
+    cam: camera.position.toArray(),
+    bbMin: bb.min.toArray(), bbMax: bb.max.toArray(),
+    drawRange: water.geometry.drawRange.count,
+    uniforms: Object.keys(material.uniforms).map(k => k + ':' + (Array.isArray(material.uniforms[k].value) ? 'arr' + material.uniforms[k].value.length : typeof material.uniforms[k].value)),
+    uRippleCount: material.uniforms.uRippleCount.value,
+  };
+};
+
+/* ---------------- interaction ---------------- */
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const downPlane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
+const hit = new THREE.Vector3();
+
+function clickRipple(e){
+  window.__WATER.clicks = (window.__WATER.clicks||0) + 1;
+  ndc.x =  (e.clientX / innerWidth ) * 2 - 1;
+  ndc.y = -(e.clientY / innerHeight) * 2 + 1;
+  ray.setFromCamera(ndc, camera);
+  if (ray.ray.intersectPlane(downPlane, hit)) {
+    window.__WATER.lastHit = [hit.x, hit.z];
+    addRipple(hit.x, hit.z, 9 + Math.random()*4);   // local (x,z) == world (x,z); plane pre-rotated
+  } else {
+    window.__WATER.lastMiss = [ndc.x.toFixed(3), ndc.y.toFixed(3)];
+  }
+}
+renderer.domElement.addEventListener('pointerdown', e => {
+  clickRipple(e);
+  orbit.dragging = true; orbit.last = [e.clientX, e.clientY];
+});
+addEventListener('pointermove', e => { if(orbit.dragging){ orbit.last = orbit.last || [e.clientX,e.clientY];
+  const dx = e.clientX - orbit.last[0], dy = e.clientY - orbit.last[1];
+  orbit.last = [e.clientX, e.clientY];
+  orbit.yaw   -= dx*0.005;
+  orbit.pitch  = Math.max(0.06, Math.min(1.45, orbit.pitch + dy*0.005));
+  syncCam();
+}});
+addEventListener('pointerup', () => orbit.dragging = false);
+addEventListener('wheel', e => { orbit.dist = Math.max(180, Math.min(3200, orbit.dist * (1 + e.deltaY*0.001))); syncCam(); }, { passive:true });
+
+const orbit = { yaw: Math.PI/4, pitch: 0.92, dist: 1300, dragging:false, last:null };
+function syncCam(){
+  const cp = Math.cos(orbit.pitch), sp = Math.sin(orbit.pitch);
+  camera.position.set(
+    orbit.dist * cp * Math.sin(orbit.yaw),
+    orbit.dist * sp,
+    orbit.dist * cp * Math.cos(orbit.yaw)
+  );
+  camera.lookAt(0, 0, 0);
+  uniforms.uCamPos.value.copy(camera.position);
+}
+syncCam();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------------- frame sample for headless verification ---------------- */
+function sampleFrame(){
+  const gl = renderer.getContext();
+  const px = new Uint8Array(4);
+  gl.readPixels(gl.drawingBufferWidth>>1, gl.drawingBufferHeight>>1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  window.__WATER.avg = [px[0],px[1],px[2]];
+  /* also sample an off-center spot to catch a fully-uniform frame */
+  const px2 = new Uint8Array(4);
+  gl.readPixels(gl.drawingBufferWidth>>2, gl.drawingBufferHeight>>1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px2);
+  window.__WATER.avg2 = [px2[0],px2[1],px2[2]];
+}
+
+/* ---------------- main loop ---------------- */
+/* single timebase for shader clock and ripple stamps (seconds since load) */
+const T0 = performance.now()/1000;
+function now(){ return performance.now()/1000 - T0; }
+let frames = 0, sampleCounter = 0;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const t = now();
+  uniforms.uTime.value = t;
+  uniforms.uRippleCount.value = rippleCount;
+  uniforms.uSunDir.value.set(
+    Math.cos(t*0.07)*0.55,
+    0.55 + Math.sin(t*0.11)*0.20,
+    Math.sin(t*0.07)*0.55
+  ).normalize();
+
+  renderer.render(scene, camera);
+  frames++;
+  if(++sampleCounter >= 40){ sampleCounter = 0; sampleFrame(); }
+  window.__WATER.ripples = rippleCount;           // fresh every frame (cheap, for QA probes)
+  if(rippleCount !== window.__lastRC){ window.__lastRC = rippleCount; slide('rc', rippleCount); }
+  if(frames % 30 === 0){
+    const dt = now() - lastFpsT;
+    window.__WATER.frames = frames;
+    window.__WATER.fps = Math.round(30.0 / Math.max(dt, 1e-3));
+    lastFpsT = now();
+    slide('fps', window.__WATER.fps);
+  }
+}
+let lastFpsT = now();
+animate();
+
+/* surface demo ripples so first paint already shows wave interaction */
+addRipple( -140,  -90, 11); addRipple(  60,  130, 10); addRipple( 150,  -60, 9);
+addRipple(  -60,  180,  8); addRipple(  20, -160, 12); addRipple(  90,   40, 7);
+</script>
+</body>
+</html>

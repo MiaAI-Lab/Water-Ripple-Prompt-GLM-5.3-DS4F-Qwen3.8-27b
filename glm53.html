@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>GPU Water — 512×512 Wave Simulation</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#04060c; }
+  canvas { display:block; touch-action:none; cursor:crosshair; }
+  #hud {
+    position:fixed; inset:0; pointer-events:none;
+    font:11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color:rgba(220,232,245,0.82); text-shadow:0 1px 3px rgba(0,0,0,0.8);
+    padding:14px 16px; box-sizing:border-box;
+  }
+  #hud .title { font-size:13px; letter-spacing:0.18em; color:#e8f2ff; }
+  #hud .title b { color:#ffb37a; }
+  #fps { position:absolute; top:14px; right:16px; text-align:right; }
+  #hints { position:absolute; bottom:12px; left:16px; }
+  #hints span { color:#ffb37a; }
+  #err {
+    position:fixed; inset:auto 0 0 0; padding:14px 18px; display:none;
+    font:12px/1.5 ui-monospace, monospace; color:#ff9c9c; background:rgba(40,0,0,0.85);
+    white-space:pre-wrap; z-index:10;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="title">GPU WATER <b>//</b> 512×512 heightfield · wave equation</div>
+  <div id="fps">– fps</div>
+  <div id="hints">
+    <span>click</span> ripple &nbsp;·&nbsp; <span>drag</span> wake &nbsp;·&nbsp;
+    <span>right-drag</span> orbit &nbsp;·&nbsp; <span>wheel</span> zoom &nbsp;·&nbsp;
+    <span>R</span> rain &nbsp;·&nbsp; <span>space</span> burst
+  </div>
+</div>
+<div id="err"></div>
+
+<script>
+  // Probe hooks + global error capture — installed before the app module runs.
+  window.__water = { frames:0, fps:0, ripples:0, error:null, pixels:null, rain:false };
+  window.addEventListener('error', function (e) {
+    window.__water.error = String(e.message || e.error || e);
+    var el = document.getElementById('err');
+    if (el) { el.style.display = 'block'; el.textContent = window.__water.error; }
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__water.error = 'rejection: ' + String(e.reason);
+  });
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   GPU water: height-field wave equation on 3 ping-pong targets
+   h(t+1) = (avg of 4 neighbors of h(t)) * 2 * ... classic
+   Elias scheme:  nh = (l+r+t+b)/2 - h(t-1),  damped.
+   Mesh: PlaneGeometry(200, 200, 512, 512), displaced in the
+   vertex shader by sampling the height texture; normals via
+   central differences. Lighting: moving sun, Fresnel sky
+   reflection, Blinn-Phong specular — all real-time.
+   ============================================================ */
+
+const SIM_RES   = 512;     // simulation texture resolution (matches mesh subdivisions)
+const WORLD     = 200;     // world size of the pool
+const AMPLITUDE = 16;      // height scale
+const MAXR      = 16;      // max ripples injected per sim step
+const STEPS_SEC = 120;     // fixed sim timestep → consistent wave speed on any refresh rate
+const NO_INTRO  = location.hash.indexOf('nointro') >= 0;
+
+let renderer, scene, camera, water, sky, simA, simB, simC;
+let simScene, simCam, simQuad;
+let ripples = [];              // queued {u, v, radius, strength}
+let frames = 0, accum = 0, lastT = 0, fpsEMA = 60, fpsShown = 0;
+let gl = null;
+
+/* ---------- shared GLSL: procedural dusk sky with sun ---------- */
+const SKY_GLSL = `
+uniform vec3 uSunDir;
+vec3 skyColor(vec3 d) {
+  float y = clamp(d.y, -1.0, 1.0);
+  vec3 zenith  = vec3(0.012, 0.040, 0.110);
+  vec3 mid     = vec3(0.085, 0.125, 0.270);
+  vec3 horizon = vec3(0.860, 0.420, 0.210);
+  vec3 c = mix(mid, zenith, smoothstep(0.08, 0.65, y));
+  c = mix(horizon, c, smoothstep(-0.02, 0.24, y));
+  c = mix(c, vec3(0.012, 0.026, 0.045), smoothstep(-0.02, -0.35, y));
+  float s = max(dot(d, uSunDir), 0.0);
+  c += vec3(1.00, 0.74, 0.44) * pow(s, 600.0) * 5.0;   // sun disc
+  c += vec3(1.00, 0.50, 0.22) * pow(s, 10.0) * 0.35;   // halo
+  c += vec3(0.90, 0.30, 0.12) * pow(s, 2.0)  * 0.10;   // wide glow
+  return c;
+}`;
+
+/* ---------- simulation material (fullscreen quad) ---------- */
+const simVert = /* glsl */`
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}`;
+
+const simFrag = /* glsl */`
+precision highp float;
+uniform sampler2D uCurr;
+uniform sampler2D uPrev;
+uniform vec2  uTexel;
+uniform float uDamp;
+uniform float uRippleCount;
+uniform vec4  uRipples[${MAXR}];
+varying vec2 vUv;
+void main() {
+  float c = texture2D(uCurr, vUv).r;
+  float l = texture2D(uCurr, vUv - vec2(uTexel.x, 0.0)).r;
+  float r = texture2D(uCurr, vUv + vec2(uTexel.x, 0.0)).r;
+  float t = texture2D(uCurr, vUv + vec2(0.0, uTexel.y)).r;
+  float b = texture2D(uCurr, vUv - vec2(0.0, uTexel.y)).r;
+  float p = texture2D(uPrev, vUv).r;
+
+  // wave equation (Elias discretization) + damping
+  float nh = ((l + r + t + b) * 0.5 - p) * uDamp;
+
+  // soft absorbing border so waves fade instead of ringing forever
+  vec2  ed = min(vUv, 1.0 - vUv);
+  float edge = smoothstep(0.0, 0.025, min(ed.x, ed.y));
+  nh *= mix(0.90, 1.0, edge);
+
+  // ripple injection (gaussian splats) — waves superpose → interference
+  for (int i = 0; i < ${MAXR}; i++) {
+    if (float(i) >= uRippleCount) break;
+    vec4 rp = uRipples[i];
+    float d = distance(vUv, rp.xy);
+    nh += rp.w * exp(-(d * d) / (rp.z * rp.z));
+  }
+  gl_FragColor = vec4(nh, 0.0, 0.0, 1.0);
+}`;
+
+/* ---------- water surface material ---------- */
+const waterVert = /* glsl */`
+uniform sampler2D uHeight;
+uniform float uSize;
+uniform float uSegs;
+uniform float uAmp;
+varying vec3  vWorldPos;
+varying vec3  vNormalW;
+varying float vH;
+void main() {
+  vec2 duv  = position.xy / uSize + 0.5;          // exact, rotation-independent uv
+  float texel = 1.0 / uSegs;
+  float h  = texture2D(uHeight, duv).r;
+  float hl = texture2D(uHeight, duv - vec2(texel, 0.0)).r;
+  float hr = texture2D(uHeight, duv + vec2(texel, 0.0)).r;
+  float hd = texture2D(uHeight, duv - vec2(0.0, texel)).r;
+  float hu = texture2D(uHeight, duv + vec2(0.0, texel)).r;
+
+  vec3 pos = position;
+  pos.z += h * uAmp;                              // displace along local normal
+
+  float dx = uSize / uSegs;
+  vec3 nLocal = normalize(vec3(-(hr - hl) * uAmp / (2.0 * dx),
+                               -(hu - hd) * uAmp / (2.0 * dx), 1.0));
+  vNormalW = normalize(mat3(modelMatrix) * nLocal);
+  vH = h;
+
+  vec4 wp = modelMatrix * vec4(pos, 1.0);
+  vWorldPos = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+const waterFrag = /* glsl */`
+precision highp float;
+${SKY_GLSL}
+uniform float uTime;
+varying vec3  vWorldPos;
+varying vec3  vNormalW;
+varying float vH;
+void main() {
+  vec3 N = normalize(vNormalW);
+  vec3 V = normalize(cameraPosition - vWorldPos);
+
+  vec3 deep    = vec3(0.012, 0.070, 0.105);
+  vec3 shallow = vec3(0.045, 0.290, 0.320);
+  vec3 base = mix(deep, shallow, smoothstep(-0.30, 0.85, vH));  // crests lighter
+
+  float fres = 0.035 + 0.965 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+  vec3 R = reflect(-V, N);
+  R.y = abs(R.y) + 0.02;                          // reflect sky dome only
+  vec3 refl = skyColor(normalize(R));
+
+  vec3 col = mix(base, refl, fres);
+
+  // sun specular — ripples sparkle as the sun drifts
+  vec3 H = normalize(V + uSunDir);
+  float spec = pow(max(dot(N, H), 0.0), 240.0) * 2.6;
+  col += vec3(1.0, 0.84, 0.58) * spec;
+
+  // foam hint on strong crests
+  col += vec3(0.55, 0.75, 0.85) * smoothstep(0.55, 1.0, vH) * 0.25;
+
+  // distance haze toward the horizon color
+  vec3 toFrag = vWorldPos - cameraPosition;
+  float dist = length(toFrag);
+  vec3 hdir = normalize(vec3(toFrag.x, 0.0, toFrag.z) + vec3(0.0, 0.015, 0.0));
+  float fog = 1.0 - exp(-dist * 0.0038);
+  col = mix(col, skyColor(hdir), clamp(fog, 0.0, 0.85));
+
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ---------- sky dome material ---------- */
+const skyVert = /* glsl */`
+varying vec3 vDir;
+void main() {
+  vDir = position;
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+const skyFrag = /* glsl */`
+precision highp float;
+${SKY_GLSL}
+varying vec3 vDir;
+void main() {
+  gl_FragColor = vec4(skyColor(normalize(vDir)), 1.0);
+}`;
+
+/* ================= setup ================= */
+
+function makeRT() {
+  const useFloat = !!gl.getExtension('EXT_color_buffer_float');
+  return new THREE.WebGLRenderTarget(SIM_RES, SIM_RES, {
+    type: useFloat ? THREE.FloatType : THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    wrapS: THREE.ClampToEdgeWrapping,
+    wrapT: THREE.ClampToEdgeWrapping,
+    depthBuffer: false,
+    stencilBuffer: false
+  });
+}
+
+function init() {
+  renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  if (!renderer.capabilities.isWebGL2) throw new Error('WebGL2 is required (vertex texture fetch + float render targets).');
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+  gl = renderer.getContext();
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.5, 4000);
+
+  /* sky dome */
+  sky = new THREE.Mesh(
+    new THREE.SphereGeometry(900, 32, 16),
+    new THREE.ShaderMaterial({
+      vertexShader: skyVert, fragmentShader: skyFrag,
+      uniforms: { uSunDir: { value: new THREE.Vector3(0, 1, 0) } },
+      side: THREE.BackSide, depthWrite: false
+    })
+  );
+  scene.add(sky);
+
+  /* water */
+  water = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD, WORLD, SIM_RES, SIM_RES),  // 512×512 subdivisions
+    new THREE.ShaderMaterial({
+      vertexShader: waterVert, fragmentShader: waterFrag,
+      uniforms: {
+        uHeight: { value: null },
+        uSize:   { value: WORLD },
+        uSegs:   { value: SIM_RES },
+        uAmp:    { value: AMPLITUDE },
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        uTime:   { value: 0 }
+      }
+    })
+  );
+  water.rotation.x = -Math.PI / 2;
+  water.updateMatrixWorld(true);
+  scene.add(water);
+
+  /* simulation */
+  simA = makeRT(); simB = makeRT(); simC = makeRT();
+  simScene = new THREE.Scene();
+  simCam = new THREE.Camera();
+  simQuad = new THREE.Mesh(
+    new THREE.PlaneGeometry(2, 2),
+    new THREE.ShaderMaterial({
+      vertexShader: simVert, fragmentShader: simFrag,
+      uniforms: {
+        uCurr: { value: null }, uPrev: { value: null },
+        uTexel: { value: new THREE.Vector2(1 / SIM_RES, 1 / SIM_RES) },
+        uDamp: { value: 0.9965 },
+        uRippleCount: { value: 0 },
+        uRipples: { value: Array.from({ length: MAXR }, () => new THREE.Vector4()) }
+      }
+    })
+  );
+  simScene.add(simQuad);
+
+  bindEvents();
+
+  if (!NO_INTRO) {
+    setTimeout(() => queueRipple(0.38, 0.42, 0.016, -0.42), 500);
+    setTimeout(() => queueRipple(0.63, 0.60, 0.020, -0.50), 1150);
+    setTimeout(() => queueRipple(0.50, 0.35, 0.014, -0.34), 1900);
+  }
+
+  lastT = performance.now();
+  requestAnimationFrame(animate);
+}
+
+/* ================= interaction ================= */
+
+const raycaster = new THREE.Raycaster();
+const seaPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const hitP = new THREE.Vector3();
+let waterPtrId = -1, orbitPtrId = -1;
+let lastWake = new THREE.Vector2(-9, -9);
+let camAz = 0.6, camEl = 0.42, camDist = 175;
+let lastPointer = { x: 0, y: 0 };
+const ndc = new THREE.Vector2();
+
+function queueRipple(u, v, radius, strength) {
+  ripples.push({ u, v, radius, strength });
+  window.__water.ripples++;
+}
+
+function splashAt(clientX, clientY, strength, radius, minDist) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  if (!raycaster.ray.intersectPlane(seaPlane, hitP)) return;
+  const local = water.worldToLocal(hitP.clone());   // plane local: z ≈ 0
+  const u = local.x / WORLD + 0.5, v = local.y / WORLD + 0.5;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return;
+  if (minDist > 0) {
+    if (Math.abs(u - lastWake.x) + Math.abs(v - lastWake.y) < minDist) return;
+    lastWake.set(u, v);
+  }
+  queueRipple(u, v, radius, strength);
+}
+
+function bindEvents() {
+  const el = renderer.domElement;
+  el.addEventListener('contextmenu', e => e.preventDefault());
+
+  el.addEventListener('pointerdown', e => {
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events have no active pointer */ }
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (e.button === 2) { orbitPtrId = e.pointerId; return; }
+    if (e.button !== 0) return;
+    waterPtrId = e.pointerId;
+    lastWake.set(-9, -9);
+    splashAt(e.clientX, e.clientY, -0.55, 0.018, 0);   // click → big ripple
+  });
+
+  el.addEventListener('pointermove', e => {
+    if (e.pointerId === orbitPtrId) {
+      camAz   -= (e.clientX - lastPointer.x) * 0.005;
+      camEl   += (e.clientY - lastPointer.y) * 0.004;
+      camEl    = Math.max(0.10, Math.min(1.25, camEl));
+      lastPointer = { x: e.clientX, y: e.clientY };
+    } else if (e.pointerId === waterPtrId) {
+      splashAt(e.clientX, e.clientY, -0.10, 0.009, 0.012);  // drag → wake
+    }
+  });
+
+  const endPtr = e => {
+    if (e.pointerId === waterPtrId) waterPtrId = -1;
+    if (e.pointerId === orbitPtrId) orbitPtrId = -1;
+  };
+  el.addEventListener('pointerup', endPtr);
+  el.addEventListener('pointercancel', endPtr);
+
+  el.addEventListener('wheel', e => {
+    e.preventDefault();
+    camDist = Math.max(70, Math.min(340, camDist * Math.exp(e.deltaY * 0.0011)));
+  }, { passive: false });
+
+  addEventListener('keydown', e => {
+    if (e.code === 'KeyR') {
+      window.__water.rain = !window.__water.rain;
+    } else if (e.code === 'Space') {
+      for (let i = 0; i < 3; i++) {
+        queueRipple(0.2 + Math.random() * 0.6, 0.2 + Math.random() * 0.6,
+                    0.010 + Math.random() * 0.012, -0.30 - Math.random() * 0.25);
+      }
+    }
+  });
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+}
+
+/* ================= simulation step ================= */
+
+function simStep(dt) {
+  const u = simQuad.material.uniforms;
+  u.uCurr.value = simA.texture;
+  u.uPrev.value = simB.texture;
+
+  const batch = ripples.splice(0, MAXR);
+  for (let i = 0; i < MAXR; i++) {
+    const rp = batch[i];
+    if (rp) u.uRipples.value[i].set(rp.u, rp.v, rp.radius, rp.strength);
+  }
+  u.uRippleCount.value = batch.length;
+
+  renderer.setRenderTarget(simC);
+  renderer.render(simScene, simCam);
+  renderer.setRenderTarget(null);
+
+  const t = simA; simA = simC; simC = simB; simB = t;   // rotate: A=now, B=prev
+  water.material.uniforms.uHeight.value = simA.texture;
+  void dt;
+}
+
+/* ================= main loop ================= */
+
+const sunDir = new THREE.Vector3();
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = Math.min((now - lastT) / 1000, 0.1) || 0;
+  lastT = now;
+  const t = now / 1000;
+
+  /* fixed-timestep sim → identical wave speed on 60/120/144 Hz displays */
+  accum += dt;
+  let steps = 0;
+  while (accum >= 1 / STEPS_SEC && steps < 3) { simStep(1 / STEPS_SEC); accum -= 1 / STEPS_SEC; steps++; }
+
+  /* rain mode */
+  if (window.__water.rain && Math.random() < 0.35) {
+    queueRipple(Math.random() * 0.9 + 0.05, Math.random() * 0.9 + 0.05,
+                0.006 + Math.random() * 0.006, -0.16 - Math.random() * 0.14);
+  }
+
+  /* slowly drifting sun → visibly moving light & specular */
+  const az = 2.45 + Math.sin(t * 0.05) * 0.55;
+  sunDir.set(Math.sin(az) * 0.9, 0.30 + Math.sin(t * 0.033) * 0.05, Math.cos(az) * 0.9).normalize();
+  water.material.uniforms.uSunDir.value.copy(sunDir);
+  sky.material.uniforms.uSunDir.value.copy(sunDir);
+  water.material.uniforms.uTime.value = t;
+
+  /* camera: gentle drift + user orbit */
+  camAz += dt * 0.012;
+  camera.position.set(
+    Math.sin(camAz) * Math.cos(camEl) * camDist,
+    Math.sin(camEl) * camDist,
+    Math.cos(camAz) * Math.cos(camEl) * camDist
+  );
+  camera.lookAt(0, 0, 0);
+  sky.position.copy(camera.position);
+
+  renderer.render(scene, camera);
+  frames++;
+
+  /* fps + pixel probe (for headless verification) */
+  fpsEMA += (1 / Math.max(dt, 1e-4) - fpsEMA) * 0.05;
+  const probe = window.__water;
+  probe.frames = frames;
+  probe.fps = fpsEMA;
+  if (frames % 30 === 1) {
+    const S = 32, x = (gl.drawingBufferWidth >> 1) - (S >> 1), y = (gl.drawingBufferHeight >> 1) - (S >> 1);
+    const buf = new Uint8Array(S * S * 4);
+    gl.readPixels(x, y, S, S, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    let sum = 0, sum2 = 0;
+    for (let i = 0; i < buf.length; i += 4) {
+      const lum = 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2];
+      sum += lum; sum2 += lum * lum;
+    }
+    const n = S * S, mean = sum / n;
+    probe.pixels = { mean: mean, std: Math.sqrt(Math.max(sum2 / n - mean * mean, 0)) };
+  }
+  if ((fpsShown = frames % 20) === 0) {
+    document.getElementById('fps').textContent = fpsEMA.toFixed(0) + ' fps · ' +
+      (window.__water.rain ? 'rain on' : 'calm') + ' · ' + frames + 'f';
+  }
+}
+
+init();
+</script>
+</body>
+</html>

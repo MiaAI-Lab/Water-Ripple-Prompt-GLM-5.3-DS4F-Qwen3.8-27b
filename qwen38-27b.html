@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tidepool — Three.js 512×512 Wave Simulation</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1b26; }
+  canvas { display: block; touch-action: none; }
+  #hud {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #d5e8f4; background: rgba(7, 14, 22, 0.58);
+    border: 1px solid rgba(120, 170, 210, 0.18);
+    padding: 10px 14px; border-radius: 10px;
+    pointer-events: none; user-select: none; max-width: 360px;
+  }
+  #hud .title { font-size: 13px; font-weight: 700; letter-spacing: 0.22em; color: #ffd9a0; }
+  #hud .sub { color: #8fb6cf; font-size: 11px; margin-top: 2px; }
+  #hud .stats { margin-top: 6px; color: #9fd8e8; font-size: 11px; }
+  #hud .help { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(120, 170, 210, 0.16); color: #7fa8c0; font-size: 11px; }
+  #hud .help b { color: #d5e8f4; font-weight: 600; }
+  #hud .err { color: #ff8f8f; margin-top: 6px; white-space: pre-wrap; max-height: 120px; overflow: hidden; }
+</style>
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div class="title">TIDEPOOL</div>
+  <div class="sub">finite-difference wave equation on a 512 × 512 plane · Three.js</div>
+  <div class="stats" id="stats">booting…</div>
+  <div class="help">
+    <b>click / drag</b> ripples&nbsp; <b>1</b> sun sweep&nbsp; <b>2</b> burst&nbsp; <b>3</b> wind&nbsp; <b>R</b> calm
+  </div>
+  <div class="err" id="errbox" hidden></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   TIDEPOOL — real-time water surface
+   · PlaneGeometry with 512×512 subdivisions (513×513 vertices)
+   · Wave propagation: finite-difference wave equation,
+     2 sub-steps per frame, damped + clamped for stability
+   · Mouse click / drag injects gaussian ripple impulses that
+     propagate and interfere with each other (linear superposition)
+   · Real-time lighting: PBR MeshStandardMaterial with per-vertex
+     normals recomputed every frame, moving shadow-casting sun,
+     procedural dusk environment map (reflections)
+   ============================================================ */
+
+const N = 512;                  // subdivisions per axis (required: 512×512)
+const V = N + 1;                // 513 vertices per axis
+const COUNT = V * V;            // 263,169 vertices
+const SIZE = 40;                // lake width in world units
+const CELL = SIZE / N;          // grid spacing (~0.078)
+const K = 0.42;                 // wave speed² (stable for < 0.5)
+const DAMP = 0.9955;            // energy loss per sub-step
+const VIS_AMP = 0.6;            // sim height -> world units
+const SUBSTEPS = 2;             // simulation steps per frame
+const CLAMP_H = 4;              // hard safety clamp on amplitude
+
+function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+
+/* ---------------- probe / error capture ---------------- */
+const errbox = document.getElementById('errbox');
+const probe = (window.__probe = {
+  verts: COUNT, tris: N * N * 2, frame: 0, fps: 0, simTime: 0,
+  sunSweep: true, wind: true, ripples: 0, lastRipple: null,
+  rippleCheck: 0, gl: 'pending', err: null
+});
+function fail(msg) {
+  probe.err = String(msg);
+  if (errbox) { errbox.hidden = false; errbox.textContent = String(msg); }
+}
+window.addEventListener('error', (e) => { if (!probe.err) fail(e.message || 'uncaught error'); });
+
+try { main(); } catch (err) { fail((err && err.stack) || err); }
+
+function main() {
+  /* ---------------- renderer ---------------- */
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  probe.gl = renderer.getContext() ? 'webgl' : 'fail';
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.08;
+  document.body.appendChild(renderer.domElement);
+
+  /* ---------------- scene & camera ---------------- */
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d1b26);
+  scene.fog = new THREE.Fog(0x0d1b26, 38, 95);
+
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 300);
+  const CAM_HOME = new THREE.Vector3(0, 13, 20);
+  camera.position.copy(CAM_HOME);
+  camera.lookAt(0, 0.4, 0);
+
+  /* ---------------- lights ---------------- */
+  scene.add(new THREE.HemisphereLight(0x8fb7d9, 0x0e1a24, 0.5));
+
+  const sun = new THREE.DirectionalLight(0xffdfb2, 2.8);
+  sun.position.set(24, 21, -10);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -26;
+  sun.shadow.camera.right = 26;
+  sun.shadow.camera.top = 26;
+  sun.shadow.camera.bottom = -26;
+  sun.shadow.camera.near = 2;
+  sun.shadow.camera.far = 110;
+  sun.shadow.camera.updateProjectionMatrix();
+  sun.shadow.bias = -0.0003;
+  sun.shadow.normalBias = 0.03;
+  scene.add(sun, sun.target);
+
+  const fill = new THREE.DirectionalLight(0x4a6fa5, 0.55);
+  fill.position.set(-22, 9, 24);
+  scene.add(fill);
+
+  /* ---------------- procedural dusk environment (PBR reflections) ---------------- */
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  let envRT;
+  {
+    const env = new THREE.Scene();
+    const skyGeo = new THREE.SphereGeometry(60, 24, 16);
+    const pos = skyGeo.attributes.position;
+    const cols = new Float32Array(pos.count * 3);
+    const cZen = new THREE.Color(0x152a44);
+    const cHor = new THREE.Color(0xbfa06f);
+    const cNad = new THREE.Color(0x05070a);
+    const tmp = new THREE.Color();
+    for (let k = 0; k < pos.count; k++) {
+      const y = pos.getY(k) / 60;
+      if (y >= 0) tmp.lerpColors(cHor, cZen, Math.pow(y, 0.65));
+      else tmp.lerpColors(cHor, cNad, Math.pow(-y, 0.5));
+      cols[k * 3] = tmp.r; cols[k * 3 + 1] = tmp.g; cols[k * 3 + 2] = tmp.b;
+    }
+    skyGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    env.add(new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(3.2, 12, 10), new THREE.MeshBasicMaterial());
+    sunDisc.material.color.setRGB(5.0, 4.2, 3.0);
+    sunDisc.position.set(34, 26, -14);
+    env.add(sunDisc);
+    const moon = new THREE.Mesh(new THREE.SphereGeometry(1.3, 10, 8), new THREE.MeshBasicMaterial());
+    moon.material.color.setRGB(0.9, 1.05, 1.35);
+    moon.position.set(-30, 30, 34);
+    env.add(moon);
+    envRT = pmrem.fromScene(env, 0.08);
+  }
+  pmrem.dispose();
+
+  /* ---------------- water mesh (512×512 plane) ---------------- */
+  const geo = new THREE.PlaneGeometry(SIZE, SIZE, N, N);
+  geo.rotateX(-Math.PI / 2);            // bake rotation: +Y up, XZ plane
+  const waterMat = new THREE.MeshStandardMaterial({
+    color: 0x1e5d8c,
+    roughness: 0.14,
+    metalness: 0.08,
+    envMap: envRT.texture,
+    envMapIntensity: 0.9,
+    side: THREE.DoubleSide
+  });
+  const water = new THREE.Mesh(geo, waterMat);
+  water.receiveShadow = true;
+  scene.add(water);
+
+  /* ---------------- simulation state ---------------- */
+  let prevA = new Float32Array(COUNT);
+  let curA  = new Float32Array(COUNT);
+  let outA  = new Float32Array(COUNT);
+
+  // clamped 4-neighbour index tables
+  const nW = new Int32Array(COUNT), nE = new Int32Array(COUNT);
+  const nN = new Int32Array(COUNT), nS = new Int32Array(COUNT);
+  for (let j = 0; j < V; j++) for (let i = 0; i < V; i++) {
+    const p = j * V + i;
+    nW[p] = j * V + Math.max(i - 1, 0);
+    nE[p] = j * V + Math.min(i + 1, V - 1);
+    nN[p] = Math.max(j - 1, 0) * V + i;
+    nS[p] = Math.min(j + 1, V - 1) * V + i;
+  }
+
+  /* ambient swell: two travelling sines on a coarse 49×49 grid,
+     bilinearly upsampled into the sim field every frame */
+  const AW = 48, AV = AW + 1, AMBF = 0.0075, AMAP = AW / (V - 1);
+  const amb = new Float32Array(AV * AV);
+  const ambP1 = new Float32Array(AV * AV), ambP2 = new Float32Array(AV * AV);
+  for (let j = 0; j < AV; j++) for (let i = 0; i < AV; i++) {
+    const x = -SIZE / 2 + i * (SIZE / AV), z = -SIZE / 2 + j * (SIZE / AV);
+    ambP1[j * AV + i] = x * 0.16 + z * 0.11;
+    ambP2[j * AV + i] = x * 0.05 - z * 0.15;
+  }
+  function ambientForcing() {
+    const w1 = Math.sin(probe.simTime * 0.82), w2 = Math.sin(probe.simTime * 0.53);
+    for (let k = 0; k < amb.length; k++) amb[k] = w1 * Math.sin(ambP1[k]) + w2 * Math.sin(ambP2[k]);
+    if (!probe.wind) return;
+    const C = curA;
+    for (let j = 0; j < V; j++) {
+      const fz = j * AMAP, j0 = Math.min(fz | 0, AW - 1), tj = fz - j0;
+      const r0 = j0 * AV, r1 = r0 + AV;
+      for (let i = 0; i < V; i++) {
+        const p = j * V + i;
+        const fx = i * AMAP, i0 = Math.min(fx | 0, AW - 1), tx = fx - i0;
+        const a0 = amb[r0 + i0] * (1 - tx) + amb[r0 + i0 + 1] * tx;
+        const a1 = amb[r1 + i0] * (1 - tx) + amb[r1 + i0 + 1] * tx;
+        C[p] += AMBF * (a0 * (1 - tj) + a1 * tj);
+      }
+    }
+  }
+
+  /* wave equation: h' = 2h - h_old + K·∇²h, damped + clamped */
+  function stepWave() {
+    const P = prevA, C = curA, O = outA;
+    for (let p = 0; p < COUNT; p++) {
+      let v = (C[nW[p]] + C[nE[p]] + C[nN[p]] + C[nS[p]] - 4 * C[p]) * K + 2 * C[p] - P[p];
+      v *= DAMP;
+      if (v > CLAMP_H) v = CLAMP_H; else if (v < -CLAMP_H) v = -CLAMP_H;
+      O[p] = v;
+    }
+    prevA = curA; curA = outA; outA = P;
+  }
+
+  /* push sim heights into the mesh + rebuild every vertex normal */
+  const posAttr = geo.attributes.position;
+  const norAttr = geo.attributes.normal;
+  function updateGeo() {
+    const P = posAttr.array, Nm = norAttr.array, C = curA;
+    const S = 0.5 * VIS_AMP / CELL;
+    for (let p = 0; p < COUNT; p++) {
+      P[p * 3 + 1] = C[p] * VIS_AMP;
+      const nx = -(C[nE[p]] - C[nW[p]]) * S;
+      const nz = -(C[nS[p]] - C[nN[p]]) * S;
+      const inv = 1 / Math.sqrt(nx * nx + nz * nz + 1);
+      Nm[p * 3] = nx * inv; Nm[p * 3 + 1] = inv; Nm[p * 3 + 2] = nz * inv;
+    }
+    posAttr.needsUpdate = true;
+    norAttr.needsUpdate = true;
+  }
+
+  /* ---------------- ripples ---------------- */
+  function splash(gi, gj, amp, rad) {
+    const R = Math.ceil(rad * 2.2);
+    const sig2 = 0.5 * rad * rad;
+    for (let dj = -R; dj <= R; dj++) {
+      const jj = gj + dj;
+      if (jj < 0 || jj >= V) continue;
+      for (let di = -R; di <= R; di++) {
+        const ii = gi + di;
+        if (ii < 0 || ii >= V) continue;
+        const d2 = di * di + dj * dj;
+        if (d2 > R * R) continue;
+        curA[jj * V + ii] += amp * Math.exp(-d2 / sig2);
+      }
+    }
+  }
+  function splashAtWorld(wx, wz, amp, rad) {
+    const gi = clamp(Math.round((wx + SIZE / 2) / CELL), 0, V - 1);
+    const gj = clamp(Math.round((wz + SIZE / 2) / CELL), 0, V - 1);
+    splash(gi, gj, amp, rad);
+    probe.ripples++;
+    probe.lastRipple = [gi, gj];
+  }
+  /* energy in a 13×13 window around the last user ripple */
+  function checkRipple() {
+    if (!probe.lastRipple) return;
+    const gi = probe.lastRipple[0], gj = probe.lastRipple[1];
+    let s = 0;
+    for (let dj = -6; dj <= 6; dj++) for (let di = -6; di <= 6; di++) {
+      const i = gi + di, j = gj + dj;
+      if (i < 0 || j < 0 || i >= V || j >= V) continue;
+      s += Math.abs(curA[j * V + i]);
+    }
+    probe.rippleCheck = s;
+  }
+
+  const schedule = [];
+  function processSchedule(dt) {
+    for (let i = schedule.length - 1; i >= 0; i--) {
+      schedule[i].t -= dt;
+      if (schedule[i].t <= 0) { const f = schedule[i].fn; schedule.splice(i, 1); f(); }
+    }
+  }
+  function burst() {
+    const cx = (Math.random() * N) | 0, cz = (Math.random() * N) | 0;
+    for (let k = 0; k < 7; k++) {
+      const ang = (k / 7) * Math.PI * 2 + Math.random() * 0.3;
+      const rr = 10 + Math.random() * 6;
+      const gi = clamp(Math.round(cx + Math.cos(ang) * rr), 0, V - 1);
+      const gj = clamp(Math.round(cz + Math.sin(ang) * rr), 0, V - 1);
+      schedule.push({ t: 0.06 * k, fn: () => splashAtWorld(gi * CELL - SIZE / 2, gj * CELL - SIZE / 2, -1.0, 2.8) });
+    }
+  }
+
+  /* ---------------- buoy (shadow-casting prop on the water) ---------------- */
+  const buoy = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.5, 1.1, 4, 12),
+    new THREE.MeshStandardMaterial({ color: 0xff7038, roughness: 0.45, metalness: 0.05 })
+  );
+  buoy.castShadow = true;
+  const BUOY = { x: 6, z: 4 };
+  scene.add(buoy);
+  const _up = new THREE.Vector3(0, 1, 0);
+  const _nrm = new THREE.Vector3();
+  function updateBuoy() {
+    const gi = clamp(Math.round((BUOY.x + SIZE / 2) / CELL), 0, V - 1);
+    const gj = clamp(Math.round((BUOY.z + SIZE / 2) / CELL), 0, V - 1);
+    const idx = gj * V + gi;
+    buoy.position.set(BUOY.x, curA[idx] * VIS_AMP + 1.0, BUOY.z);
+    _nrm.set(-(curA[nE[idx]] - curA[nW[idx]]), 1, -(curA[nS[idx]] - curA[nN[idx]])).normalize();
+    buoy.quaternion.setFromUnitVectors(_up, _nrm);
+  }
+
+  /* ---------------- pointer interaction ---------------- */
+  const raycaster = new THREE.Raycaster();
+  const planeY0 = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const hitPt = new THREE.Vector3();
+  const ndc = new THREE.Vector2();
+  const par = { x: 0, y: 0 };
+  let pointerDown = false, lastSplashIdx = -1, lastSplashT = 0;
+
+  function worldAt(e) {
+    const r = renderer.domElement.getBoundingClientRect();
+    ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    if (!raycaster.ray.intersectPlane(planeY0, hitPt)) return null;
+    return hitPt;
+  }
+  const el = renderer.domElement;
+  el.addEventListener('pointerdown', (e) => {
+    pointerDown = true;
+    try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    const w = worldAt(e);
+    if (w) splashAtWorld(w.x, w.z, -1.7, 3.4);
+  });
+  el.addEventListener('pointermove', (e) => {
+    par.x = (e.clientX / window.innerWidth) * 2 - 1;
+    par.y = (e.clientY / window.innerHeight) * 2 - 1;
+    if (!pointerDown) return;
+    const now = performance.now();
+    if (now - lastSplashT < 34) return;
+    const w = worldAt(e);
+    if (!w) return;
+    const gi = clamp(Math.round((w.x + SIZE / 2) / CELL), 0, V - 1);
+    const gj = clamp(Math.round((w.z + SIZE / 2) / CELL), 0, V - 1);
+    const key = gj * V + gi;
+    if (key === lastSplashIdx) return;
+    lastSplashIdx = key; lastSplashT = now;
+    splashAtWorld(w.x, w.z, -0.5, 2.2);
+  });
+  function endPointer() { pointerDown = false; lastSplashIdx = -1; }
+  el.addEventListener('pointerup', endPointer);
+  el.addEventListener('pointercancel', endPointer);
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === '1') probe.sunSweep = !probe.sunSweep;
+    else if (e.key === '2') burst();
+    else if (e.key === '3') probe.wind = !probe.wind;
+    else if (e.key === 'r' || e.key === 'R') {
+      prevA.fill(0); curA.fill(0); outA.fill(0);
+      probe.lastRipple = null;
+      schedule.push({ t: 0.15, fn: () => splashAtWorld(0, 0, -1.2, 3) });
+    }
+  });
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  /* ---------------- intro ripples + auto-drip ---------------- */
+  schedule.push({ t: 0.15, fn: () => splashAtWorld(-4, 2, -1.4, 3.2) });
+  schedule.push({ t: 0.55, fn: () => splashAtWorld(3.5, -2.5, -1.1, 2.8) });
+  let nextDrip = 2.2;
+
+  /* ---------------- main loop ---------------- */
+  const stats = document.getElementById('stats');
+  let last = performance.now(), fpsE = 60, statT = 0;
+  let sunAngle = Math.atan2(-10, 24);
+  let stopped = false;
+
+  function tick() {
+    if (stopped) return;
+    try {
+      const now = performance.now();
+      let dt = (now - last) / 1000;
+      last = now;
+      if (dt > 0.05) dt = 0.05;
+      fpsE = fpsE * 0.92 + (1 / Math.max(dt, 1e-4)) * 0.08;
+      probe.fps = fpsE;
+      probe.simTime += dt;
+      probe.frame++;
+
+      processSchedule(dt);
+      if (probe.simTime >= nextDrip) {
+        nextDrip = probe.simTime + 3.2 + Math.random() * 1.6;
+        splash((Math.random() * N) | 0, (Math.random() * N) | 0, -0.4, 2.4);
+      }
+
+      ambientForcing();
+      for (let s = 0; s < SUBSTEPS; s++) stepWave();
+      updateGeo();
+      updateBuoy();
+      checkRipple();
+
+      if (probe.sunSweep) sunAngle += dt * 0.14;
+      sun.position.set(Math.cos(sunAngle) * 26, 21 - Math.sin(sunAngle * 0.7) * 3, Math.sin(sunAngle) * 26);
+
+      camera.position.set(CAM_HOME.x + par.x * 2.4, CAM_HOME.y - par.y * 1.4, CAM_HOME.z);
+      camera.lookAt(0, 0.4, 0);
+
+      renderer.render(scene, camera);
+
+      statT += dt;
+      if (statT > 0.5) {
+        statT = 0;
+        stats.textContent = Math.round(fpsE) + ' fps · ' + COUNT.toLocaleString('en-US') +
+          ' verts · ' + (N * N * 2).toLocaleString('en-US') + ' tris · ripples ' + probe.ripples;
+      }
+      requestAnimationFrame(tick);
+    } catch (err) {
+      stopped = true;
+      fail((err && err.stack) || err);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+</script>
+</body>
+</html>
