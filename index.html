@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Water Ripple Prompt — GLM-5.3 · DS4F · Qwen3.8-27B</title>
+<style>
+  :root { --bg:#04121c; --card:#0a1d2e; --line:rgba(120,180,255,.22); --txt:#cfe8ff; --mut:#7fa8c0; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:
+    radial-gradient(1200px 600px at 70% -10%, rgba(61,112,144,.35), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgba(5,48,74,.6), transparent 60%),
+    var(--bg); color:var(--txt); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:28px; padding:32px; }
+  h1 { font-size:18px; letter-spacing:.22em; margin:0 0 6px; text-align:center; }
+  h1 b { color:#9fd4ff; }
+  .sub { color:var(--mut); text-align:center; max-width:640px; margin:0; }
+  .prompt { color:#bedaf2; background:rgba(7,20,31,.65); border:1px solid var(--line);
+    border-radius:10px; padding:14px 18px; max-width:720px; font-size:12.5px; white-space:pre-wrap; }
+  .prompt b { color:#ffd9a0; }
+  .grid { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
+  a.card { display:block; width:230px; text-decoration:none; color:var(--txt);
+    border:1px solid var(--line); border-radius:12px; padding:18px 16px;
+    background:linear-gradient(180deg, rgba(13,34,52,.9), rgba(7,19,30,.9));
+    transition:transform .12s ease, border-color .12s ease, box-shadow .12s ease; }
+  a.card:hover { transform:translateY(-3px); border-color:rgba(159,212,255,.6); box-shadow:0 8px 24px rgba(0,0,0,.4); }
+  .model { font-size:15px; font-weight:700; letter-spacing:.04em; margin-bottom:6px; }
+  .model.ds  { color:#6ecbf5; } .model.glm5 { color:#ffb37a; } .model.qwen { color:#9ff0b8; }
+  .file { font-size:12px; color:var(--mut); margin-bottom:12px; word-break:break-all; }
+  .tag { display:inline-block; font-size:10.5px; padding:2px 8px; border-radius:20px;
+    border:1px solid var(--line); color:var(--mut); margin-top:8px; }
+  .open { margin-top:12px; font-size:11.5px; color:#9fd4ff; letter-spacing:.08em; }
+  footer { color:var(--mut); font-size:11.5px; text-align:center; }
+  footer a { color:#9fd4ff; }
+</style>
+</head>
+<body>
+  <h1>WATER RIPPLE <b>//</b> PROMPT SHOOTOUT</h1>
+  <p class="sub">Three LLMs — GLM-5.3, DeepSeek v4 Flash, Qwen3.8-27B — given the same prompt, independently produced these single-file Three.js demos. Click a card to open it in a new window.</p>
+
+  <div class="prompt"><b>PROMPT:</b>
+Create a Three.js water simulation.
+Requirements:
+Plane mesh with 512x512 subdivisions
+Wave propagation simulation
+Mouse click creates ripples
+Multiple interacting waves
+Real-time lighting
+Everything in a single HTML file
+No external libraries besides Three.js</div>
+
+  <div class="grid">
+    <a class="card" href="ds4f.html" target="_blank" rel="noopener">
+      <div class="model ds">DeepSeek v4 Flash</div>
+      <div class="file">ds4f.html</div>
+      <span class="tag">analytic shader waves</span>
+      <div class="open">▶ open demo</div>
+    </a>
+    <a class="card" href="glm53.html" target="_blank" rel="noopener">
+      <div class="model glm5">GLM-5.3</div>
+      <div class="file">glm53.html</div>
+      <span class="tag">GPU wave equation</span>
+      <div class="open">▶ open demo</div>
+    </a>
+    <a class="card" href="qwen38-27b.html" target="_blank" rel="noopener">
+      <div class="model qwen">Qwen3.8-27B</div>
+      <div class="file">qwen38-27b.html</div>
+      <span class="tag">CPU finite-difference</span>
+      <div class="open">▶ open demo</div>
+    </a>
+  </div>
+
+  <footer><a href="https://github.com/MiaAI-Lab/Water-Ripple-Prompt-GLM-5.3-DS4F-Qwen3.8-27b" target="_blank" rel="noopener">github</a> · details in <a href="https://github.com/MiaAI-Lab/Water-Ripple-Prompt-GLM-5.3-DS4F-Qwen3.8-27b/blob/main/README.md" target="_blank" rel="noopener">README</a></footer>
+</body>
+</html>
